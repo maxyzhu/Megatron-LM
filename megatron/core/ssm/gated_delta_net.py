@@ -489,8 +489,8 @@ class GatedDeltaNet(MegatronModule):
 
         nvtx_range_push(suffix="gated_delta_rule")
         if self.recompute_gated_delta_rule:
-            assert self.config.deterministeic_mode, (
-                "gdn_gated_delta_rule recompute currently requires deterministic mode."
+            assert self.config.deterministic_mode, (
+                "gdn_gated_delta_rule recompute currently requires deterministic mode. "
                 "(FLA kernel is non-deterministic: recompute would break gradients)."
             )
             def _gdr_fn(q, k, v, g_, b_):
