@@ -682,3 +682,85 @@ class TestFusedThdAllToAll:
         back = self._batched_a2a_hp2cp(mid, cu, self.cp_group)
 
         assert torch.equal(back, local_t), "Batched cp2hp -> hp2cp not identity"
+
+
+# -----selective-recompute config validation tests, cpu only-----
+class TestGDNSelectiveRecomputeConfigValidation:
+    """selective-recompute config validation tests, cpu only."""
+
+    GDN_RECOMPUTE_MODULES = ["gdn_in_proj", "gdn_conv1d", "gdn_gated_delta_rule"]
+
+    @staticmethod
+    def _gdn_recompute_config_kwargs(**overrides):
+        """Minimal kwargs for a valid gated_delta_net TransformerConfig.
+
+        Only the fields required by ``__post_init__`` for the gated_delta_net
+        branch are set; everything else keeps its default. No CUDA / dist state
+        is touched, so this constructs fine on CPU.
+        """
+        kwargs = dict(
+            num_layers=1,
+            hidden_size=2048,
+            num_attention_heads=16,
+            num_query_groups=2,
+            activation_func=F.silu,
+            experimental_attention_variant="gated_delta_net",
+            linear_attention_freq=[1],
+            linear_conv_kernel_dim=4,
+            linear_key_head_dim=128,
+            linear_value_head_dim=128,
+            linear_num_key_heads=16,
+            linear_num_value_heads=32,
+            recompute_granularity="selective",
+        )
+        kwargs.update(overrides)
+        return kwargs
+
+
+    @pytest.mark.parametrize("module", GDN_RECOMPUTE_MODULES)
+    def test_gdn_recompute_module_accepted(self, module):
+        """Each new GDN module is accepted with experimental_attention_variant=gdn."""
+        config = TransformerConfig(**self._gdn_recompute_config_kwargs(recompute_modules=[module]))
+        assert module in config.recompute_modules
+
+
+    def test_gdn_recompute_all_three_accepted(self):
+        """All three switches together are accepted."""
+        config = TransformerConfig(
+            **self._gdn_recompute_config_kwargs(recompute_modules=list(GDN_RECOMPUTE_MODULES))
+        )
+        assert set(GDN_RECOMPUTE_MODULES).issubset(set(config.recompute_modules))
+
+
+    def test_gdn_recompute_coexists_with_norm_out(self):
+        """New switches coexist with the pre-existing gdn_norm_out switch."""
+        modules = ["gdn_norm_out", *GDN_RECOMPUTE_MODULES]
+        config = TransformerConfig(**self._gdn_recompute_config_kwargs(recompute_modules=modules))
+        assert set(modules).issubset(set(config.recompute_modules))
+
+
+    @pytest.mark.parametrize("module", GDN_RECOMPUTE_MODULES)
+    def test_gdn_recompute_requires_gated_delta_net(self, module):
+        """Enabling a GDN switch without the gated_delta_net variant raises."""
+        with pytest.raises(
+            ValueError, match="only supported with experimental_attention_variant='gated_delta_net'"
+        ):
+            TransformerConfig(
+                **self._gdn_recompute_config_kwargs(
+                    recompute_modules=[module],
+                    experimental_attention_variant=None,
+                    # Drop gdn-only required fields so the config is otherwise valid.
+                    linear_attention_freq=None,
+                    linear_conv_kernel_dim=None,
+                    linear_key_head_dim=None,
+                    linear_value_head_dim=None,
+                    linear_num_key_heads=None,
+                    linear_num_value_heads=None,
+                )
+            )
+
+
+    def test_gdn_recompute_rejects_typo(self):
+        """A misspelled module name is caught by the allowed_modules assert."""
+        with pytest.raises(AssertionError, match="Invalid choices for recompute_modules"):
+            TransformerConfig(**self._gdn_recompute_config_kwargs(recompute_modules=["gdn_inproj"]))

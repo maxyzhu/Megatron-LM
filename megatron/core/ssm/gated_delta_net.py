@@ -223,8 +223,15 @@ class GatedDeltaNet(MegatronModule):
         )
         self.recompute_norm_out = False
         self.norm_out_checkpoint = None
+        self.recompute_in_proj = False
+        self.recompute_conv1d = False
+        self.recompute_gated_delta_rule = False
+        # recompute_gated_delta_rule may need a checkpoint instance (same as norm_out) later
         if self.config.recompute_granularity == "selective":
             self.recompute_norm_out = "gdn_norm_out" in self.config.recompute_modules
+            self.recompute_in_proj = "gdn_in_proj" in self.config.recompute_modules
+            self.recompute_conv1d = "gdn_conv1d" in self.config.recompute_modules
+            self.recompute_gated_delta_rule = "gdn_gated_delta_rule" in self.config.recompute_modules
 
         self.out_proj = build_module(
             submodules.out_proj,
@@ -343,7 +350,13 @@ class GatedDeltaNet(MegatronModule):
 
         # Input projection
         nvtx_range_push(suffix="in_proj")
-        qkvzba, _ = self.in_proj(hidden_states)
+        if self.recompute_in_proj:
+            def _in_proj_fn(hs):
+                out, _bias = self.in_proj(hs)
+                return out
+            qkvzba = tensor_parallel.checkpoint(_in_proj_fn, False, hidden_states)
+        else:
+            qkvzba, _ = self.in_proj(hidden_states)
         nvtx_range_pop(suffix="in_proj")
 
         # CP All to All: CP to HP
@@ -410,46 +423,52 @@ class GatedDeltaNet(MegatronModule):
             self.qk_dim_local_tp,
             self.v_dim_local_tp,
         ]
-        conv1d_weight = get_parameter_local_cp(
-            self.conv1d.weight,
-            dim=0,
-            cp_group=self.pg_collection.cp,
-            split_sections=qkv_channels_split_sections,
-        )
-        conv1d_bias = (
-            get_parameter_local_cp(
-                self.conv1d.bias,
+        def _conv1d_fn(qkv):
+            conv1d_weight = get_parameter_local_cp(
+                self.conv1d.weight,
                 dim=0,
                 cp_group=self.pg_collection.cp,
                 split_sections=qkv_channels_split_sections,
             )
-            if self.conv_bias
-            else None
-        )
-        if self.config.deterministic_mode:
-            qkv = qkv.transpose(1, 2).contiguous()  # b, s, d -> b, d, s
-            conv_out = F.conv1d(
-                input=qkv,  # Torch-native only accept [b, d, s] format input
-                weight=conv1d_weight,
-                bias=conv1d_bias,
-                stride=self.conv1d.stride,
-                padding=self.conv1d.padding,
-                dilation=self.conv1d.dilation,
-                groups=self.conv_dim_local_tp // self.cp_size,
+            conv1d_bias = (
+                get_parameter_local_cp(
+                    self.conv1d.bias,
+                    dim=0,
+                    cp_group=self.pg_collection.cp,
+                    split_sections=qkv_channels_split_sections,
+                )
+                if self.conv_bias
+                else None
             )
-            qkv = self.act_fn(conv_out[..., :seq_len])
-            qkv = qkv.transpose(1, 2)  # b, d, s -> b, s, d
+            if self.config.deterministic_mode:
+                qkv = qkv.transpose(1, 2).contiguous()  # b, s, d -> b, d, s
+                conv_out = F.conv1d(
+                    input=qkv,  # Torch-native only accept [b, d, s] format input
+                    weight=conv1d_weight,
+                    bias=conv1d_bias,
+                    stride=self.conv1d.stride,
+                    padding=self.conv1d.padding,
+                    dilation=self.conv1d.dilation,
+                    groups=self.conv_dim_local_tp // self.cp_size,
+                )
+                qkv = self.act_fn(conv_out[..., :seq_len])
+                qkv = qkv.transpose(1, 2)  # b, d, s -> b, s, d
+            else:
+                assert self.activation in ["silu", "swish"]
+                qkv, _ = causal_conv1d(
+                    x=qkv,  # FLA conv1d accepts [b, s, d] format input
+                    weight=conv1d_weight.squeeze(1),  # d, 1, w -> d, w
+                    bias=conv1d_bias,
+                    activation=self.activation,
+                    initial_state=None,
+                    output_final_state=False,
+                    cu_seqlens=cu_seqlens_q,
+                )
+            return qkv
+        if self.recompute_conv1d:
+            qkv = tensor_parallel.checkpoint(_conv1d_fn, False, qkv)
         else:
-            assert self.activation in ["silu", "swish"]
-            qkv, _ = causal_conv1d(
-                x=qkv,  # FLA conv1d accepts [b, s, d] format input
-                weight=conv1d_weight.squeeze(1),  # d, 1, w -> d, w
-                bias=conv1d_bias,
-                activation=self.activation,
-                initial_state=None,
-                output_final_state=False,
-                cu_seqlens=cu_seqlens_q,
-            )
+            qkv = _conv1d_fn(qkv)
         nvtx_range_pop(suffix="conv1d")
 
         # Prepare QKV tensors (split, reshape, L2 norm, repeat_interleave, contiguous)
@@ -469,17 +488,38 @@ class GatedDeltaNet(MegatronModule):
         nvtx_range_pop(suffix="g_and_beta")
 
         nvtx_range_push(suffix="gated_delta_rule")
-        core_attn_out, last_recurrent_state = self.gated_delta_rule(
-            query,
-            key,
-            value,
-            g=g,
-            beta=beta,
-            initial_state=None,
-            output_final_state=False,
-            use_qk_l2norm_in_kernel=False,
-            cu_seqlens=cu_seqlens_q,
-        )
+        if self.recompute_gated_delta_rule:
+            assert self.config.deterministeic_mode, (
+                "gdn_gated_delta_rule recompute currently requires deterministic mode."
+                "(FLA kernel is non-deterministic: recompute would break gradients)."
+            )
+            def _gdr_fn(q, k, v, g_, b_):
+                out, _state = self.gated_delta_rule(
+                    q,
+                    k,
+                    v,
+                    g=g_,
+                    beta=b_,
+                    initial_state=None,
+                    output_final_state=False,
+                    use_qk_l2norm_in_kernel=False,
+                    cu_seqlens=cu_seqlens_q,
+                )
+                return out
+            core_attn_out = tensor_parallel.checkpoint(_gdr_fn, False, query, key, value, g, beta)
+            last_recurrent_state = None
+        else:
+            core_attn_out, last_recurrent_state = self.gated_delta_rule(
+                query,
+                key,
+                value,
+                g=g,
+                beta=beta,
+                initial_state=None,
+                output_final_state=False,
+                use_qk_l2norm_in_kernel=False,
+                cu_seqlens=cu_seqlens_q,
+            )
         nvtx_range_pop(suffix="gated_delta_rule")
 
         def _gated_norm_and_a2a(core_attn_out: torch.Tensor, gate: torch.Tensor):

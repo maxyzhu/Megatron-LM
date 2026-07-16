@@ -546,6 +546,9 @@ class TransformerConfig(ModelParallelConfig):
     "moe": recompute the MoE layer.
     "shared_experts": recompute the shared experts in the MoE layer.
     "gdn_norm_out": recompute the GatedDeltaNet output norm and HP-to-CP all-to-all.
+    "gdn_in_proj": recompute the GatedDeltaNet input projection.
+    "gdn_conv1d": recompute the GatedDeltaNet QKV convolution.
+    "gdn_gated_delta_rule": recompute the GatedDeltaNet gated delta rule core.
     "moe_act", "layernorm", "mla_up_proj", and "gdn_norm_out" use output-discarding checkpointing,
     "core_attn", "mlp", "moe", and "shared_experts" use normal checkpointing.
     """
@@ -1738,6 +1741,9 @@ class TransformerConfig(ModelParallelConfig):
                     "moe",
                     "shared_experts",
                     "gdn_norm_out",
+                    "gdn_in_proj",
+                    "gdn_conv1d",
+                    "gdn_gated_delta_rule",
                 }
                 invalid_modules = set(self.recompute_modules) - allowed_modules
                 assert not invalid_modules, (
@@ -1762,6 +1768,33 @@ class TransformerConfig(ModelParallelConfig):
             ):
                 raise ValueError(
                     "gdn_norm_out in recompute_modules is only supported with "
+                    "experimental_attention_variant='gated_delta_net'."
+                )
+
+            if (
+                "gdn_in_proj" in self.recompute_modules
+                and self.experimental_attention_variant != "gated_delta_net"
+            ):
+                raise ValueError(
+                    "gdn_in_proj in recompute_modules is only supported with "
+                    "experimental_attention_variant='gated_delta_net'."
+                )
+            
+            if (
+                "gdn_conv1d" in self.recompute_modules
+                and self.experimental_attention_variant != "gated_delta_net"
+            ):
+                raise ValueError(
+                    "gdn_conv1d in recompute_modules is only supported with "
+                    "experimental_attention_variant='gated_delta_net'."
+                )
+            
+            if (
+                "gdn_gated_delta_rule" in self.recompute_modules
+                and self.experimental_attention_variant != "gated_delta_net"
+            ):
+                raise ValueError(
+                    "gdn_gated_delta_rule in recompute_modules is only supported with "
                     "experimental_attention_variant='gated_delta_net'."
                 )
 
