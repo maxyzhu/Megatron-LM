@@ -27,7 +27,7 @@ from megatron.core.ssm.gated_delta_net import (
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
-from megatron.core.utils import unwrap_model
+from megatron.core.utils import unwrap_model, is_te_min_version
 from megatron.training.arguments import parse_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from megatron.training.global_vars import set_args
@@ -504,6 +504,109 @@ class TestGatedDeltaNet:
             assert torch.equal(
                 rec_grads[name], base_grads[name]
             ), f"Grad not identical for {name} ({module=}, {rank=})"
+    
+
+    def test_in_proj_recompute_with_delay_wgrad(self):
+        """gdn_in_proj recompute must be compatible with delayed weight-grad compute.
+
+        Design-doc §4.1: in_proj recompute reruns the linear's forward during
+        backward, while delay_wgrad_compute defers its weight-grad to an explicit
+        backward_dw() call. Both branches enable delay_wgrad_compute; the only
+        difference is the recompute switch, so any mismatch isolates a
+        recompute-vs-delayed-wgrad interaction (not TE's delay-vs-no-delay numerics).
+        Deterministic mode makes the comparison bitwise.
+        """
+        if not is_te_min_version("2.3.0"):
+            pytest.skip("delay_wgrad_compute requires TransformerEngine >= 2.3.0")
+
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        cp_group = parallel_state.get_context_parallel_group()
+        pg_collection = ProcessGroupCollection(tp=tp_group, cp=cp_group)
+
+        def build_gdn(config):
+            gdn_submodules = get_experimental_attention_variant_module_spec(
+                config=config
+            ).submodules
+            gdn = GatedDeltaNet(
+                config,
+                submodules=gdn_submodules,
+                layer_number=1,
+                bias=False,
+                conv_bias=False,
+                conv_init=1.0,
+                use_qk_l2norm=True,
+                A_init_range=(1, 16),
+                pg_collection=pg_collection,
+            )
+            return gdn.cuda().bfloat16()
+
+        def run(gdn, hidden_states):
+            output, _ = gdn(hidden_states, None)
+            output.float().sum().backward()
+            # Flush deferred weight grads (no-op when delay_wgrad_compute is off).
+            gdn.backward_dw()
+            grads = {
+                name: param.grad.detach()
+                for name, param in gdn.named_parameters()
+                if param.grad is not None
+            }
+            input_grad = hidden_states.grad.detach().clone()
+            return output.detach(), grads, input_grad
+
+        micro_batch_size = 2
+        seq_length = 64
+
+        # Both branches: deterministic + delayed wgrad. Only recompute differs.
+        base_config = copy.deepcopy(self.transformer_config)
+        base_config.deterministic_mode = True
+        base_config.delay_wgrad_compute = True
+
+        rec_config = copy.deepcopy(self.transformer_config)
+        rec_config.deterministic_mode = True
+        rec_config.delay_wgrad_compute = True
+        rec_config.recompute_granularity = "selective"
+        rec_config.recompute_modules = ["gdn_in_proj"]
+
+        model_parallel_cuda_manual_seed(42)
+        torch.manual_seed(42)
+        hidden_states = torch.randn(
+            (
+                seq_length // self.sp_size // self.cp_size,
+                micro_batch_size,
+                self.gdn.config.hidden_size,
+            ),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+
+        # --- Baseline: delayed wgrad, NO recompute ---
+        model_parallel_cuda_manual_seed(42)
+        torch.manual_seed(42)
+        base_gdn = build_gdn(base_config)
+        assert base_gdn.recompute_in_proj is False
+        base_output, base_grads, base_input_grad = run(base_gdn, hidden_states)
+        hidden_states.grad = None
+        del base_gdn
+        torch.cuda.empty_cache()
+
+        # --- Delayed wgrad + in_proj recompute ---
+        model_parallel_cuda_manual_seed(42)
+        torch.manual_seed(42)
+        rec_gdn = build_gdn(rec_config)
+        assert rec_gdn.recompute_in_proj is True
+        rec_output, rec_grads, rec_input_grad = run(rec_gdn, hidden_states)
+
+        rank = torch.distributed.get_rank()
+        assert torch.equal(rec_output, base_output), f"Output not identical ({rank=})"
+        assert torch.equal(
+            rec_input_grad, base_input_grad
+        ), f"Input grad not identical ({rank=})"
+        assert set(rec_grads.keys()) == set(base_grads.keys())
+        for name in base_grads:
+            assert torch.equal(
+                rec_grads[name], base_grads[name]
+            ), f"Grad not identical for {name} ({rank=})"
 
 
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
