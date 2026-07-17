@@ -28,7 +28,7 @@ def kernel(q, k, v, g, beta):
     out, _ = chunk_gated_delta_rule(
         q, k, v, g=g, beta=beta,
         initial_state=None, output_final_state=False,
-        use_qk_l2norm_in_kernel=False, cu_seqlens=None,
+        use_qk_l2norm_in_kernel=True, cu_seqlens=None,
     )
     return out
 

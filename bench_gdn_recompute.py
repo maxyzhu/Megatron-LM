@@ -76,15 +76,48 @@ def bench(deterministic, recompute_module, pg_collection, sp_size):
     gdn = build_gdn(config, pg_collection)
 
     local_seq = SEQ_LEN // sp_size // CP
-    assert local_seq * sp_size * CP == SEQ_LEN, (
-        f"SEQ_LEN={SEQ_LEN} must be divisible by sp_size*CP={sp_size * CP}"
-    )
+    assert local_seq * sp_size * CP == SEQ_LEN
     hs = torch.randn(
         (local_seq, BATCH, config.hidden_size),
         device=torch.cuda.current_device(),
         dtype=torch.bfloat16,
         requires_grad=True,
     )
+
+    def fwd_bwd(measure_act=False):
+        gdn.zero_grad(set_to_none=True)
+        if hs.grad is not None:
+            hs.grad = None
+        act_mem = None
+        if measure_act:
+            torch.cuda.synchronize()
+            before = torch.cuda.memory_allocated()
+        out, _ = gdn(hs, None)
+        if measure_act:
+            torch.cuda.synchronize()
+            act_mem = (torch.cuda.memory_allocated() - before) / (1024 ** 2)  # MB retained for bwd
+        out.float().sum().backward()
+        return act_mem
+
+    for _ in range(WARMUP):
+        fwd_bwd()
+    torch.cuda.synchronize()
+
+    # activation memory retained after forward (the checkpoint-relevant number)
+    act_mem = fwd_bwd(measure_act=True)
+
+    # clean timing + full-step peak
+    torch.cuda.reset_peak_memory_stats()
+    t0 = time.perf_counter()
+    for _ in range(ITERS):
+        fwd_bwd()
+    torch.cuda.synchronize()
+    dt = (time.perf_counter() - t0) / ITERS * 1e3
+    peak = torch.cuda.max_memory_allocated() / (1024 ** 2)
+
+    del gdn, hs
+    torch.cuda.empty_cache()
+    return dt, peak, act_mem
 
     def step():
         gdn.zero_grad(set_to_none=True)
@@ -135,27 +168,25 @@ def main():
 
     results = {}
     for label, det, mod in runs:
-        dt, peak = bench(det, mod, pg, sp_size)
-        results[label] = (dt, peak)
+        dt, peak, act = bench(det, mod, pg, sp_size)
+        results[label] = (dt, peak, act)
         if rank0:
-            print(f"{label:32s}  {dt:8.2f} ms/iter   {peak:9.1f} MB peak (rank0)")
+            print(f"{label:32s} {dt:8.2f} ms  peak {peak:8.1f}MB  act {act:8.1f}MB")
 
     if rank0:
-        def pct(a, b):
-            return (a - b) / b * 100.0
-
-        base_nd_t, base_nd_m = results["baseline (non-det)"]
-        base_d_t, base_d_m = results["baseline (det)"]
-
-        print(f"\n=== config: TP={TP} CP={CP} SP={SP} SEQ_LEN={SEQ_LEN} BATCH={BATCH} ===")
-        print(f"{'segment':28s} {'mem saved %':>12s} {'time overhead %':>16s}")
-        for label, base_t, base_m in [
-            ("gdn_in_proj (non-det)", base_nd_t, base_nd_m),
-            ("gdn_conv1d (non-det)", base_nd_t, base_nd_m),
-            ("gdn_gated_delta_rule (det)", base_d_t, base_d_m),
+        def pct(a, b): return (a - b) / b * 100.0
+        b_nd = results["baseline (non-det)"]
+        b_d = results["baseline (det)"]
+        print(f"\n=== TP={TP} CP={CP} SP={SP} SEQ_LEN={SEQ_LEN} BATCH={BATCH} ===")
+        print(f"{'segment':28s} {'act saved %':>12s} {'peak saved %':>13s} {'time ovhd %':>12s}")
+        for label, base in [
+            ("gdn_in_proj (non-det)", b_nd),
+            ("gdn_conv1d (non-det)", b_nd),
+            ("gdn_gated_delta_rule (det)", b_d),
         ]:
-            t, m = results[label]
-            print(f"{label:28s} {(-pct(m, base_m)):12.2f} {pct(t, base_t):16.2f}")
+            dt, peak, act = results[label]
+            bdt, bpeak, bact = base
+            print(f"{label:28s} {-pct(act, bact):12.2f} {-pct(peak, bpeak):13.2f} {pct(dt, bdt):12.2f}")
 
     Utils.destroy_model_parallel()
 
