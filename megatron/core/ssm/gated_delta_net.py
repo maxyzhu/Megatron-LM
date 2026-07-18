@@ -348,7 +348,7 @@ class GatedDeltaNet(MegatronModule):
             cu_seqlens_q = None
             cu_seqlens_kv = None
 
-                # ==== BOUNDARY-SWEEP SCAFFOLD (measurement only; single-GPU, non-packed) ====
+        # ==== BOUNDARY-SWEEP SCAFFOLD (measurement only; single-GPU, non-packed) ====
         # Sweeps the in_proj-region recompute checkpoint boundary W1..W4.
         # NOT for the feature branch. Requires cp=1 and non-packed input.
         import os
@@ -430,8 +430,25 @@ class GatedDeltaNet(MegatronModule):
             if _boundary == "W4":
                 return _s_prepare(qkv, gate, beta, alpha)
             raise ValueError(f"unknown GDN_INPROJ_BOUNDARY={_boundary}")
+            
+        if _boundary == "E2":
+            # Exclude in_proj: run it un-checkpointed, recompute only a2a+split+conv.
+            # Tests whether the memory win survives WITHOUT recomputing in_proj.
+            qkvzba = _s_in_proj(hidden_states)  # outside checkpoint -> qkvzba retained
 
-        if self.recompute_in_proj:
+            def _region_no_inproj(z):
+                qkv_, gate_, beta_, alpha_ = _s_a2a_split(z)
+                qkv_ = _s_conv(qkv_)
+                return qkv_, gate_, beta_, alpha_
+
+            if self.recompute_in_proj:
+                qkv, gate, beta, alpha = tensor_parallel.checkpoint(
+                    _region_no_inproj, False, qkvzba
+                )
+            else:
+                qkv, gate, beta, alpha = _region_no_inproj(qkvzba)
+            query, key, value, gate, beta, alpha = _s_prepare(qkv, gate, beta, alpha)
+        elif self.recompute_in_proj:
             outs = tensor_parallel.checkpoint(_prefix, False, hidden_states)
         else:
             outs = _prefix(hidden_states)
